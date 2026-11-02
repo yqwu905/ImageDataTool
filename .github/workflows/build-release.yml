@@ -53,6 +53,25 @@ jobs:
       - name: Build, test and package portable executable
         shell: pwsh
         run: ./build-windows.ps1 -Configuration MinSizeRel -Package -Version $env:RELEASE_VERSION
+      - name: Measure viewer performance against v1.0.0
+        shell: pwsh
+        run: |
+          git fetch --depth=1 origin tag v1.0.0
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot fetch benchmark baseline' }
+          New-Item -ItemType Directory -Force build/perf-baseline | Out-Null
+          git archive --format=tar -o build/baseline.tar v1.0.0
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot archive benchmark baseline' }
+          tar -xf build/baseline.tar -C build/perf-baseline
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot extract benchmark baseline' }
+          $baseline = (Resolve-Path build/perf-baseline).Path.Replace('\', '/')
+          cmake -S . -B build -DIMAGECOMPARE_BUILD_BENCHMARKS=ON "-DIMAGECOMPARE_BASELINE_DIR=$baseline"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot configure performance harness' }
+          cmake --build build --config MinSizeRel --target performance_benchmark performance_baseline --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot build performance harness' }
+          & ./build/MinSizeRel/performance_baseline.exe build/perf-fixtures build/performance-before.json
+          if ($LASTEXITCODE -ne 0) { throw 'Baseline benchmark failed' }
+          & ./build/MinSizeRel/performance_benchmark.exe build/perf-fixtures build/performance-after.json
+          if ($LASTEXITCODE -ne 0) { throw 'Updated benchmark failed' }
       - name: Upload Windows packages
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -69,6 +88,8 @@ jobs:
           path: |
             build/test-results.xml
             build/Testing/Temporary/LastTest.log
+            build/performance-before.json
+            build/performance-after.json
           if-no-files-found: ignore
           retention-days: 14
 

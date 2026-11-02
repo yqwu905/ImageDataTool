@@ -17,12 +17,13 @@
 #include <condition_variable>
 #include <thread>
 #include <atomic>
-#include "image_io.hpp"
+#include "background.hpp"
 
 using namespace Gdiplus;
 using platform::utf8;
 using platform::wide;
-constexpr UINT WM_IMAGE_READY = WM_APP + 1, WM_EXPORT_DONE = WM_APP + 2, WM_EXPORT_PROGRESS = WM_APP + 3;
+constexpr UINT WM_IMAGE_READY = WM_APP + 1, WM_EXPORT_DONE = WM_APP + 2, WM_EXPORT_PROGRESS = WM_APP + 3,
+               WM_SCAN_READY = WM_APP + 4;
 struct Box {
     float x = 0, y = 0, w = 0, h = 0;
     bool contains(float px, float py) const { return px >= x && py >= y && px < x + w && py < y + h; }
@@ -31,101 +32,6 @@ struct Box {
 struct Hit {
     Box box;
     int id;
-};
-struct CacheEntry {
-    std::shared_ptr<Bitmap> image;
-    std::wstring error;
-    uint64_t age = 0;
-};
-class Loader {
-    HWND hwnd;
-    std::thread worker;
-    std::mutex mu;
-    std::condition_variable cv;
-    bool stop = false;
-    int maxEdge = 2560;
-    uint64_t generation = 0, tick = 0;
-    std::deque<std::pair<std::string, uint64_t>> jobs;
-    std::set<std::string> pending;
-    std::map<std::string, CacheEntry> cache;
-    size_t bytes = 0;
-    static size_t size(const CacheEntry &e) {
-        return e.image ? size_t(e.image->GetWidth()) * e.image->GetHeight() * 4 : 0;
-    }
-    void run() {
-        while (true) {
-            std::pair<std::string, uint64_t> job;
-            int edge = 2560;
-            {
-                std::unique_lock<std::mutex> lock(mu);
-                cv.wait(lock, [&] { return stop || !jobs.empty(); });
-                if (stop)
-                    return;
-                job = jobs.front();
-                jobs.pop_front();
-                edge = maxEdge;
-            }
-            CacheEntry e;
-            try {
-                e.image = platform::load(job.first, edge);
-            } catch (const std::exception &ex) {
-                e.error = wide(ex.what());
-            }
-            {
-                std::lock_guard<std::mutex> lock(mu);
-                if (job.second != generation)
-                    continue;
-                pending.erase(job.first);
-                e.age = ++tick;
-                bytes += size(e);
-                cache[job.first] = e;
-                while ((bytes > 128 * 1024 * 1024 || cache.size() > 512) && cache.size() > 1) {
-                    auto oldest =
-                        std::min_element(cache.begin(), cache.end(), [](const auto &a, const auto &b) {
-                            return a.second.age < b.second.age;
-                        });
-                    bytes -= size(oldest->second);
-                    cache.erase(oldest);
-                }
-            }
-            PostMessageW(hwnd, WM_IMAGE_READY, 0, 0);
-        }
-    }
-
-  public:
-    explicit Loader(HWND w) : hwnd(w), worker([this] { run(); }) {}
-    ~Loader() {
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            stop = true;
-        }
-        cv.notify_one();
-        if (worker.joinable())
-            worker.join();
-    }
-    CacheEntry get(const std::string &path) {
-        std::lock_guard<std::mutex> lock(mu);
-        auto it = cache.find(path);
-        if (it != cache.end()) {
-            it->second.age = ++tick;
-            return it->second;
-        }
-        if (pending.insert(path).second) {
-            jobs.push_back({path, generation});
-            cv.notify_one();
-        }
-        return {};
-    }
-    void clear(size_t paneCount = 1) {
-        std::lock_guard<std::mutex> lock(mu);
-        maxEdge = std::min(
-            2560, std::max(256, int(std::sqrt(96. * 1024 * 1024 / (4 * std::max(size_t(1), paneCount))))));
-        ++generation;
-        jobs.clear();
-        pending.clear();
-        cache.clear();
-        bytes = 0;
-    }
 };
 struct InputState {
     HWND edit = nullptr;
@@ -327,9 +233,19 @@ class App {
     HWND hwnd = nullptr;
     ic::Model model;
     std::unique_ptr<Loader> loader;
+    std::unique_ptr<FolderScanner> scanner;
+    bool scanning = false, scanRefresh = false, scanMarksDirty = false;
+    uint64_t scanGeneration = 0;
+    std::vector<std::wstring> scanPaths;
     // GDI+ resources must be destroyed before GdiplusShutdown, not at process static teardown.
     std::unique_ptr<FontFamily> preferredFont;
     bool fontInitialized = false;
+    std::map<std::pair<int, bool>, std::unique_ptr<Font>> fonts;
+    HDC backDC = nullptr, imageDC = nullptr;
+    HBITMAP backBitmap = nullptr;
+    HGDIOBJ oldBackBitmap = nullptr;
+    int backWidth = 0, backHeight = 0;
+    uint64_t bufferAllocations = 0, renderedFrames = 0, interactiveUntil = 0;
     float scale = 1, width = 1280, height = 800;
     std::vector<Hit> hits;
     std::vector<Pane> panes;
@@ -353,7 +269,17 @@ class App {
         cancelExport = true;
         if (exportWorker.joinable())
             exportWorker.join();
+        scanner.reset();
         loader.reset();
+        if (backDC) {
+            if (oldBackBitmap)
+                SelectObject(backDC, oldBackBitmap);
+            if (backBitmap)
+                DeleteObject(backBitmap);
+            DeleteDC(backDC);
+        }
+        if (imageDC)
+            DeleteDC(imageDC);
     }
     void invalidate() { InvalidateRect(hwnd, nullptr, FALSE); }
     void title() {
@@ -374,7 +300,7 @@ class App {
     void refreshFilter() { visible = model.filtered(filter); }
     bool currentValid() const {
         return model.position < model.rows.size() &&
-               std::find(visible.begin(), visible.end(), model.position) != visible.end();
+               std::binary_search(visible.begin(), visible.end(), model.position);
     }
     std::vector<std::string> currentPaths() const {
         return currentValid() ? model.rows[model.position].paths : std::vector<std::string>{};
@@ -407,9 +333,15 @@ class App {
         index = std::clamp(index + delta, 0, int(visible.size()) - 1);
         model.position = visible[index];
         status = L"";
+        interact();
         invalidate();
     }
     bool save(bool as = false) {
+        if (scanning) {
+            status = L"文件夹扫描中，完成后即可保存项目";
+            invalidate();
+            return false;
+        }
         if (as || projectPath.empty()) {
             auto paths = choose(hwnd, false, true);
             if (paths.empty())
@@ -446,55 +378,87 @@ class App {
         auto s = prefix + L"\n" + wide(e.what());
         MessageBoxW(hwnd, s.c_str(), L"图片对比", MB_OK | MB_ICONERROR);
     }
+    void cancelScan() {
+        if (scanner)
+            scanner->cancel();
+        ++scanGeneration;
+        scanning = false;
+        scanPaths.clear();
+    }
+    void startScan(std::vector<std::wstring> paths, bool refresh, bool marksDirty) {
+        scanPaths = std::move(paths);
+        scanRefresh = refresh;
+        scanMarksDirty = marksDirty;
+        scanning = true;
+        status = L"正在后台扫描 " + std::to_wstring(scanPaths.size()) + L" 个文件夹，可继续浏览…";
+        scanner->submit(++scanGeneration, model.folders, scanPaths, model.byName, refresh);
+        invalidate();
+    }
+    std::vector<std::wstring> folderPaths() const {
+        std::vector<std::wstring> paths;
+        for (auto &f : model.folders)
+            paths.push_back(wide(f.path));
+        return paths;
+    }
     void addFolders(const std::vector<std::wstring> &paths) {
-        int added = 0;
-        std::wstring failures;
-        for (auto &p : paths) {
-            if (model.folders.size() >= 256) {
-                failures += L"文件夹上限为 256。\n";
+        if (paths.empty())
+            return;
+        auto desired = scanning ? scanPaths : folderPaths();
+        std::set<std::string> keys;
+        for (auto &path : desired)
+            keys.insert(platform::pathKey(fs::path(path)));
+        for (auto &path : paths) {
+            if (desired.size() >= 256) {
+                status = L"文件夹上限为 256";
+                invalidate();
                 break;
             }
-            try {
-                auto absolute = fs::absolute(fs::path(p)).lexically_normal();
-                auto key = platform::pathKey(absolute);
-                bool exists = false;
-                for (auto &f : model.folders)
-                    if (platform::pathKey(fs::path(wide(f.path))) == key)
-                        exists = true;
-                if (exists)
-                    continue;
-                auto path = utf8(absolute.wstring());
-                auto files = platform::scan(path);
-                model.folders.push_back({path, std::move(files)});
-                ++added;
-            } catch (const std::exception &) {
-                failures += p + L"\n";
-            }
+            auto absolute = fs::absolute(fs::path(path)).lexically_normal();
+            if (keys.insert(platform::pathKey(absolute)).second)
+                desired.push_back(absolute.wstring());
         }
-        if (added) {
-            model.rebuild();
-            ensurePosition();
+        if (desired.size() != (scanning ? scanPaths.size() : model.folders.size()))
+            startScan(std::move(desired), scanning && scanRefresh, true);
+    }
+    void scanReady() {
+        auto result = scanner->take();
+        if (!result || result->generation != scanGeneration)
+            return;
+        scanning = false;
+        scanPaths.clear();
+        if (!result->error.empty()) {
+            status = L"扫描失败：" + result->error;
+            invalidate();
+            return;
+        }
+        model.folders = std::move(result->folders);
+        model.rows = std::move(result->rows);
+        if (model.rows.empty())
+            model.position = 0;
+        else
+            model.position = std::min(model.position, model.rows.size() - 1);
+        selected = std::max(0, std::min(selected, int(model.folders.size()) - 1));
+        if (scanRefresh)
             loader->clear(model.folders.size());
-            resetView();
-            changed(L"已添加 " + std::to_wstring(added) + L" 个文件夹");
-        }
-        if (!failures.empty())
-            MessageBoxW(hwnd, (L"以下文件夹未能添加：\n" + failures).c_str(), L"添加文件夹",
-                        MB_OK | MB_ICONWARNING);
+        else
+            loader->configure(model.folders.size());
+        ensurePosition();
+        status =
+            result->added ? L"已添加 " + std::to_wstring(result->added) + L" 个文件夹" : L"文件夹扫描完成";
+        if (scanMarksDirty)
+            changed(status);
+        else
+            invalidate();
+        if (!result->warning.empty())
+            MessageBoxW(hwnd, (L"以下文件夹读取失败，已有编辑和列表已保留：\n" + result->warning).c_str(),
+                        L"扫描结果", MB_OK | MB_ICONWARNING);
     }
     void open(const std::wstring &path) {
         if (!canReplace())
             return;
         try {
             auto next = ic::deserialize(platform::readProject(path));
-            std::wstring missing;
-            for (auto &f : next.folders) {
-                try {
-                    f.files = platform::scan(f.path);
-                } catch (...) {
-                    missing += wide(f.path) + L"\n";
-                }
-            }
+            cancelScan();
             model = std::move(next);
             projectPath = path;
             filter = -1;
@@ -503,38 +467,15 @@ class App {
             focus = false;
             dirty = false;
             loader->clear(model.folders.size());
-            model.rebuild();
             ensurePosition();
             resetView();
             title();
-            status = L"项目已打开";
-            invalidate();
-            if (!missing.empty())
-                MessageBoxW(hwnd,
-                            (L"以下文件夹不可用，已保留路径和编辑。恢复路径后可刷新：\n" + missing).c_str(),
-                            L"文件夹不可用", MB_OK | MB_ICONWARNING);
+            startScan(folderPaths(), true, false);
         } catch (const std::exception &e) {
             error(L"打开失败，当前项目未改变", e);
         }
     }
-    void rescan() {
-        std::wstring missing;
-        for (auto &f : model.folders) {
-            try {
-                f.files = platform::scan(f.path);
-            } catch (...) {
-                missing += wide(f.path) + L"\n";
-            }
-        }
-        model.rebuild();
-        ensurePosition();
-        loader->clear(model.folders.size());
-        status = L"已重新扫描文件夹";
-        invalidate();
-        if (!missing.empty())
-            MessageBoxW(hwnd, (L"扫描失败，保留了上次列表：\n" + missing).c_str(), L"刷新",
-                        MB_OK | MB_ICONWARNING);
-    }
+    void rescan() { startScan(scanning ? scanPaths : folderPaths(), true, scanning && scanMarksDirty); }
     void loadSettings() {
         try {
             if (settingsPath.empty()) {
@@ -636,7 +577,7 @@ class App {
                     L"2. 顺序配对按自然排序（2 在 10 前）；文件名匹配包含扩展名，忽略大小写，缺图保留空位。\n"
                     L"3. 点击图片选中；黑框工具 R "
                     L"在任意图片上拖动，同步应用到本组所有有效图片。不同尺寸按比例定位。\n"
-                    L"4. 滚轮同步缩放，右键拖动或空格+左键同步平移，F 适应窗口。\n"
+                    L"4. 滚轮同步缩放，浏览模式左键拖动平移；黑框模式可用右键或空格+左键平移，F 适应窗口。\n"
                     L"5. 左右方向键 / PageUp、PageDown 切换对比组；Tab 轮流选图；V "
                     L"切换并排/单图。单图模式下黑框仍同步整组。\n"
                     L"6. A/B/C/D 切换选中图片的标记；可勾选“标记整组”；1–9 对应前九类。设置中可新增类别。\n"
@@ -644,7 +585,7 @@ class App {
                     L"8. Ctrl+S 保存项目，Ctrl+O 打开项目，Ctrl+Shift+S 另存为。导出不会覆盖原图。\n"
                     L"9. 筛选以对比组为单位；批量导出包含筛选组内所有有效图片。\n\n"
                     L"支持 PNG/JPEG/BMP/GIF/TIFF；GIF/TIFF 读取首帧。预览最长边 "
-                    L"2560，导出保持原始像素尺寸（EXIF 方向纠正后），上限 1.2 亿像素。\n"
+                    L"2048，导出保持原始像素尺寸（EXIF 方向纠正后），上限 1.2 亿像素。\n"
                     L"项目保存路径、类别、标记、黑框；撤销历史在本次会话内有效。",
                     L"图片对比 · 使用说明", MB_OK | MB_ICONINFORMATION);
     }
@@ -760,6 +701,11 @@ class App {
         });
     }
     void command(int id) {
+        if (scanning && (id == C_FOLDER_REMOVE || id == C_FOLDER_UP || id == C_FOLDER_DOWN)) {
+            status = L"扫描完成后可调整文件夹顺序";
+            invalidate();
+            return;
+        }
         if (id >= C_CATEGORY_BASE && id < C_CATEGORY_BASE + 100) {
             size_t i = id - C_CATEGORY_BASE;
             if (i < model.categories.size()) {
@@ -802,6 +748,7 @@ class App {
             break;
         case C_NEW:
             if (canReplace()) {
+                cancelScan();
                 model = ic::Model{};
                 model.categories = defaultCategories;
                 projectPath.clear();
@@ -823,16 +770,14 @@ class App {
             break;
         case C_MODE:
             model.byName = !model.byName;
-            model.rebuild();
-            ensurePosition();
-            changed(model.byName ? L"按文件名匹配，缺图保留空位" : L"按自然顺序配对");
+            startScan(scanning ? scanPaths : folderPaths(), scanning && scanRefresh, true);
             break;
         case C_FILTER:
             filterMenu();
             break;
         case C_RECT:
             rectTool = !rectTool;
-            status = rectTool ? L"拖动绘制黑色矩形，同步应用于当前整组" : L"浏览模式：点击选图，滚轮缩放";
+            status = rectTool ? L"拖动绘制黑色矩形，同步应用于当前整组" : L"浏览模式：左键拖动平移，滚轮缩放";
             invalidate();
             break;
         case C_UNDO:
@@ -961,15 +906,19 @@ class App {
                 }
             }
         }
-        Font font(preferredFont ? preferredFont.get() : FontFamily::GenericSansSerif(), size,
-                  bold ? FontStyleBold : FontStyleRegular, UnitPixel);
+        auto key = std::make_pair(int(std::round(size * 100)), bold);
+        auto &cached = fonts[key];
+        if (!cached)
+            cached =
+                std::make_unique<Font>(preferredFont ? preferredFont.get() : FontFamily::GenericSansSerif(),
+                                       size, bold ? FontStyleBold : FontStyleRegular, UnitPixel);
         SolidBrush brush(c);
         StringFormat f;
         f.SetAlignment(align);
         f.SetLineAlignment(StringAlignmentCenter);
         f.SetTrimming(StringTrimmingEllipsisCharacter);
         f.SetFormatFlags(StringFormatFlagsNoWrap);
-        g.DrawString(s.c_str(), int(s.size()), &font, b.rect(), &f, &brush);
+        g.DrawString(s.c_str(), int(s.size()), cached.get(), b.rect(), &f, &brush);
     }
     void button(Graphics &g, Box b, const std::wstring &label, int id, bool active = false,
                 bool enabled = true) {
@@ -994,14 +943,105 @@ class App {
         }
         return s;
     }
+    void interact() {
+        interactiveUntil = GetTickCount64() + 120;
+        SetTimer(hwnd, 1, 120, nullptr);
+    }
+    void clampPan(const Pane &pane) {
+        double mx = std::max(0., double(pane.image.w - pane.view.w) / std::max(1.f, pane.view.w) / 2);
+        double my = std::max(0., double(pane.image.h - pane.view.h) / std::max(1.f, pane.view.h) / 2);
+        panX = std::clamp(panX, -mx, mx);
+        panY = std::clamp(panY, -my, my);
+    }
+    void zoomAt(PointF p, double factor) {
+        double before = zoom;
+        zoom = std::clamp(zoom * factor, .1, 32.);
+        for (auto &pane : panes)
+            if (pane.view.contains(p.X, p.Y) && pane.image.w > 0) {
+                double ratio = zoom / before;
+                double u = (p.X - pane.image.x) / pane.image.w, v = (p.Y - pane.image.y) / pane.image.h;
+                panX =
+                    (p.X - (pane.view.x + pane.view.w / 2) - (u - .5) * pane.image.w * ratio) / pane.view.w;
+                panY =
+                    (p.Y - (pane.view.y + pane.view.h / 2) - (v - .5) * pane.image.h * ratio) / pane.view.h;
+                Pane next = pane;
+                next.image.w *= float(ratio);
+                next.image.h *= float(ratio);
+                clampPan(next);
+                break;
+            }
+        interact();
+        invalidate();
+    }
+    bool prepareBuffer(HDC dc, int w, int h) {
+        if (w <= 0 || h <= 0)
+            return false;
+        if (!backDC) {
+            backDC = CreateCompatibleDC(dc);
+            imageDC = CreateCompatibleDC(dc);
+        }
+        if (!backDC || !imageDC)
+            return false;
+        if (w != backWidth || h != backHeight) {
+            if (backBitmap) {
+                SelectObject(backDC, oldBackBitmap);
+                DeleteObject(backBitmap);
+                backBitmap = nullptr;
+            }
+            backBitmap = CreateCompatibleBitmap(dc, w, h);
+            if (!backBitmap)
+                return false;
+            auto previous = SelectObject(backDC, backBitmap);
+            if (!oldBackBitmap)
+                oldBackBitmap = previous;
+            backWidth = w;
+            backHeight = h;
+            ++bufferAllocations;
+        }
+        return true;
+    }
+    void requestImages() {
+        if (!currentValid()) {
+            loader->want({}, {});
+            return;
+        }
+        auto current = currentPaths();
+        std::vector<std::string> adjacent;
+        if (focus && selected >= 0 && size_t(selected) < current.size()) {
+            for (size_t i = 0; i < current.size(); ++i)
+                if (int(i) != selected)
+                    adjacent.push_back(current[i]);
+            current = {current[selected]};
+        }
+        auto it = std::lower_bound(visible.begin(), visible.end(), model.position);
+        for (int direction : {1, -1}) {
+            auto index = int64_t(it - visible.begin()) + direction;
+            if (index >= 0 && size_t(index) < visible.size()) {
+                auto &paths = model.rows[visible[size_t(index)]].paths;
+                if (focus && selected >= 0 && size_t(selected) < paths.size())
+                    adjacent.push_back(paths[selected]);
+                else
+                    adjacent.insert(adjacent.end(), paths.begin(), paths.end());
+            }
+        }
+        loader->want(current, adjacent);
+    }
     void paint(HDC dc) {
         RECT client;
         GetClientRect(hwnd, &client);
         width = (client.right - client.left) / scale;
         height = (client.bottom - client.top) / scale;
-        HDC buffer = CreateCompatibleDC(dc);
-        HBITMAP bitmap = CreateCompatibleBitmap(dc, std::max(1L, client.right), std::max(1L, client.bottom));
-        auto old = SelectObject(buffer, bitmap);
+        if (!prepareBuffer(dc, client.right, client.bottom))
+            return;
+        HDC buffer = backDC;
+        struct Draw {
+            std::shared_ptr<platform::Preview> bitmap;
+            Box image, view;
+            const ic::Edit *edit;
+        };
+        std::vector<Draw> draws;
+        draws.reserve(model.folders.size());
+        requestImages();
         {
             Graphics g(buffer);
             g.ScaleTransform(scale, scale);
@@ -1092,7 +1132,7 @@ class App {
             button(g, {railX, height - 142, right - 20, 29}, L"清除整组黑框", C_CLEAR_RECTS, false,
                    currentValid());
             text(g, L"← → 切组    Tab 切图", {railX, height - 96, right - 20, 20}, 10, color(116, 134, 164));
-            text(g, L"滚轮缩放 · 右键拖动平移", {railX, height - 74, right - 20, 20}, 10,
+            text(g, L"左键拖动平移 · 滚轮缩放", {railX, height - 74, right - 20, 20}, 10,
                  color(116, 134, 164));
             text(g, L"Ctrl+Z 撤销 · Ctrl+S 保存", {railX, height - 52, right - 20, 20}, 10,
                  color(116, 134, 164));
@@ -1100,7 +1140,7 @@ class App {
             auto paths = currentPaths();
             if (model.folders.empty()) {
                 fill(g, area, color(20, 27, 39), 9);
-                text(g, L"把需要对比的文件夹放在一起",
+                text(g, scanning ? L"正在后台整理图片列表…" : L"把需要对比的文件夹放在一起",
                      {area.x + 20, area.y + area.h / 2 - 53, area.w - 40, 42}, 22, color(218, 229, 252), true,
                      StringAlignmentCenter);
                 text(g, L"添加多个文件夹，按顺序或文件名对齐图片",
@@ -1146,26 +1186,12 @@ class App {
                         auto entry = loader->get(p.path);
                         if (entry.image) {
                             auto &image = *entry.image;
-                            float iw = float(image.GetWidth()), ih = float(image.GetHeight());
+                            float iw = float(image.width), ih = float(image.height);
                             double fit = std::min(p.view.w / iw, p.view.h / ih);
                             float dw = float(iw * fit * zoom), dh = float(ih * fit * zoom);
                             p.image = {p.view.x + (p.view.w - dw) / 2 + float(panX * p.view.w),
                                        p.view.y + (p.view.h - dh) / 2 + float(panY * p.view.h), dw, dh};
-                            auto clip = g.Save();
-                            g.SetClip(p.view.rect());
-                            g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-                            g.DrawImage(&image, p.image.rect());
-                            auto drawMask = [&](const ic::Rect &r) {
-                                fill(g,
-                                     {p.image.x + float(r.x) * dw, p.image.y + float(r.y) * dh,
-                                      float(r.w) * dw, float(r.h) * dh},
-                                     color(0, 0, 0));
-                            };
-                            for (auto &r : model.edit(p.path).rects)
-                                drawMask(r);
-                            if (previewValid)
-                                drawMask(preview);
-                            g.Restore(clip);
+                            draws.push_back({entry.image, p.image, p.view, &model.edit(p.path)});
                         } else {
                             text(g, entry.error.empty() ? L"正在加载…" : L"读取失败 · 请检查文件或刷新",
                                  p.view, 12, color(142, 155, 177), false, StringAlignmentCenter);
@@ -1201,10 +1227,51 @@ class App {
             text(g, message, {mainX, height - 45, mainW, 26}, 11, color(142, 160, 190));
             g.Flush(FlushIntentionSync);
         }
+        bool quick = drag != 0 || GetTickCount64() < interactiveUntil;
+        for (auto &draw : draws) {
+            int state = SaveDC(buffer);
+            IntersectClipRect(buffer, int(std::ceil(draw.view.x * scale)),
+                              int(std::ceil(draw.view.y * scale)),
+                              int(std::floor((draw.view.x + draw.view.w) * scale)),
+                              int(std::floor((draw.view.y + draw.view.h) * scale)));
+            float left = std::max(draw.view.x, draw.image.x), top = std::max(draw.view.y, draw.image.y);
+            float right = std::min(draw.view.x + draw.view.w, draw.image.x + draw.image.w);
+            float bottom = std::min(draw.view.y + draw.view.h, draw.image.y + draw.image.h);
+            if (right > left && bottom > top) {
+                auto &bitmap = *draw.bitmap;
+                int sx = std::clamp(int(std::floor((left - draw.image.x) / draw.image.w * bitmap.width)), 0,
+                                    bitmap.width - 1);
+                int sy = std::clamp(int(std::floor((top - draw.image.y) / draw.image.h * bitmap.height)), 0,
+                                    bitmap.height - 1);
+                int sr = std::clamp(int(std::ceil((right - draw.image.x) / draw.image.w * bitmap.width)),
+                                    sx + 1, bitmap.width);
+                int sb = std::clamp(int(std::ceil((bottom - draw.image.y) / draw.image.h * bitmap.height)),
+                                    sy + 1, bitmap.height);
+                int dx = int(std::round((draw.image.x + draw.image.w * sx / bitmap.width) * scale));
+                int dy = int(std::round((draw.image.y + draw.image.h * sy / bitmap.height) * scale));
+                int dr = int(std::round((draw.image.x + draw.image.w * sr / bitmap.width) * scale));
+                int db = int(std::round((draw.image.y + draw.image.h * sb / bitmap.height) * scale));
+                auto previous = SelectObject(imageDC, bitmap.bitmap);
+                SetStretchBltMode(buffer, quick ? COLORONCOLOR : HALFTONE);
+                SetBrushOrgEx(buffer, 0, 0, nullptr);
+                StretchBlt(buffer, dx, dy, dr - dx, db - dy, imageDC, sx, sy, sr - sx, sb - sy, SRCCOPY);
+                SelectObject(imageDC, previous);
+                auto mask = [&](const ic::Rect &r) {
+                    RECT rect{LONG(std::floor((draw.image.x + r.x * draw.image.w) * scale)),
+                              LONG(std::floor((draw.image.y + r.y * draw.image.h) * scale)),
+                              LONG(std::ceil((draw.image.x + (r.x + r.w) * draw.image.w) * scale)),
+                              LONG(std::ceil((draw.image.y + (r.y + r.h) * draw.image.h) * scale))};
+                    FillRect(buffer, &rect, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+                };
+                for (auto &r : draw.edit->rects)
+                    mask(r);
+                if (previewValid)
+                    mask(preview);
+            }
+            RestoreDC(buffer, state);
+        }
         BitBlt(dc, 0, 0, client.right, client.bottom, buffer, 0, 0, SRCCOPY);
-        SelectObject(buffer, old);
-        DeleteObject(bitmap);
-        DeleteDC(buffer);
+        ++renderedFrames;
     }
     PointF point(LPARAM lp) { return {GET_X_LPARAM(lp) / scale, GET_Y_LPARAM(lp) / scale}; }
     void mouseDown(PointF p, bool right = false) {
@@ -1213,11 +1280,13 @@ class App {
             auto &pane = panes[k];
             if (pane.view.contains(p.X, p.Y)) {
                 selected = pane.folder;
-                if (right || (GetKeyState(VK_SPACE) & 0x8000)) {
+                if (right || !rectTool || (GetKeyState(VK_SPACE) & 0x8000)) {
                     drag = 2;
                     last = p;
                     dragPane = int(k);
                     SetCapture(hwnd);
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+                    interact();
                     invalidate();
                     return;
                 }
@@ -1271,10 +1340,10 @@ class App {
             if (dragPane >= 0 && size_t(dragPane) < panes.size()) {
                 panX += (p.X - last.X) / std::max(1.f, panes[dragPane].view.w);
                 panY += (p.Y - last.Y) / std::max(1.f, panes[dragPane].view.h);
-                panX = std::clamp(panX, -10., 10.);
-                panY = std::clamp(panY, -10., 10.);
+                clampPan(panes[dragPane]);
             }
             last = p;
+            interact();
             invalidate();
             return;
         }
@@ -1283,6 +1352,7 @@ class App {
         auto &image = panes[dragPane].image;
         preview = ic::rectangle(start.X, start.Y, (p.X - image.x) / image.w, (p.Y - image.y) / image.h);
         previewValid = preview.w * image.w >= 2 && preview.h * image.h >= 2;
+        interact();
         invalidate();
     }
     void mouseUp(PointF p) {
@@ -1370,6 +1440,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
         app->scale = GetDpiForWindow(hwnd) / 96.f;
         app->loader = std::make_unique<Loader>(hwnd);
+        app->scanner = std::make_unique<FolderScanner>(hwnd);
         DragAcceptFiles(hwnd, TRUE);
         return 0;
     case WM_PAINT: {
@@ -1432,8 +1503,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         double factor = std::pow(1.16, GET_WHEEL_DELTA_WPARAM(wp) / 120.);
-        app->zoom = std::clamp(app->zoom * factor, 0.1, 32.);
-        app->invalidate();
+        app->zoomAt({p.x / app->scale, p.y / app->scale}, factor);
         return 0;
     }
     case WM_KEYDOWN:
@@ -1448,17 +1518,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::wstring p(n + 1, 0);
             DragQueryFileW(drop, i, p.data(), n + 1);
             p.resize(n);
-            std::error_code ec;
-            if (fs::is_directory(fs::path(p), ec))
-                paths.push_back(p);
-            else if (platform::folded(fs::path(p).extension().wstring()) == L".icmp")
+            if (platform::folded(fs::path(p).extension().wstring()) == L".icmp")
                 app->open(p);
+            else
+                paths.push_back(p);
         }
         DragFinish(drop);
         if (!paths.empty())
             app->addFolders(paths);
         return 0;
     }
+    case WM_SCAN_READY:
+        app->scanReady();
+        return 0;
+    case WM_TIMER:
+        if (wp == 1 && app->drag == 0 && GetTickCount64() >= app->interactiveUntil) {
+            KillTimer(hwnd, 1);
+            app->invalidate();
+        }
+        return 0;
+    case WM_SETCURSOR:
+        if (app->drag == 2) {
+            SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+            return TRUE;
+        }
+        break;
     case WM_IMAGE_READY:
     case WM_EXPORT_PROGRESS:
         app->invalidate();
@@ -1491,6 +1575,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     default:
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
+    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1531,11 +1616,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         std::vector<std::wstring> folders;
         for (int i = 1; i < argc; ++i) {
             std::wstring p = argv[i];
-            std::error_code ec;
-            if (fs::is_directory(fs::path(p), ec))
-                folders.push_back(p);
-            else if (platform::folded(fs::path(p).extension().wstring()) == L".icmp")
+            if (platform::folded(fs::path(p).extension().wstring()) == L".icmp")
                 app.open(p);
+            else
+                folders.push_back(p);
         }
         if (argv)
             LocalFree(argv);

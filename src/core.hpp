@@ -100,9 +100,11 @@ struct Model {
     }
     void rebuild() {
         rows.clear();
-        for (auto &f : folders)
-            std::sort(f.files.begin(), f.files.end(),
-                      [](const File &a, const File &b) { return naturalLess(a.key, b.key); });
+        for (auto &f : folders) {
+            auto less = [](const File &a, const File &b) { return naturalLess(a.key, b.key); };
+            if (!std::is_sorted(f.files.begin(), f.files.end(), less))
+                std::sort(f.files.begin(), f.files.end(), less);
+        }
         if (byName) {
             std::map<std::string, Row> keyed;
             for (size_t i = 0; i < folders.size(); ++i)
@@ -140,6 +142,12 @@ struct Model {
     // -1 = all; -2 = unmarked; -3 = any mark; otherwise category index.
     std::vector<size_t> filtered(int filter) const {
         std::vector<size_t> result;
+        result.reserve(rows.size());
+        if (filter == -1) {
+            for (size_t i = 0; i < rows.size(); ++i)
+                result.push_back(i);
+            return result;
+        }
         for (size_t i = 0; i < rows.size(); ++i) {
             bool match = filter == -1, any = false;
             for (auto &path : rows[i].paths)

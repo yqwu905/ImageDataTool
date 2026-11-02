@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <atomic>
 #include "core.hpp"
 namespace fs = std::filesystem;
 namespace platform {
@@ -41,25 +42,48 @@ inline std::wstring folded(std::wstring w) {
 inline std::string pathKey(const fs::path &p) {
     return utf8(folded(fs::absolute(p).lexically_normal().wstring()));
 }
-inline std::vector<ic::File> scan(const std::string &folder) {
+inline std::vector<ic::File> scan(const std::string &folder, const std::atomic<bool> *cancelled = nullptr) {
     std::vector<ic::File> files;
-    std::error_code ec;
-    fs::directory_iterator it(fs::path(wide(folder)), ec);
-    if (ec)
+    auto base = fs::absolute(fs::path(wide(folder))).lexically_normal();
+    auto prefix = utf8(base.wstring());
+    if (!prefix.empty() && prefix.back() != '\\')
+        prefix += '\\';
+    auto pattern = (base / L"*").wstring();
+    WIN32_FIND_DATAW data{};
+    HANDLE search = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr,
+                                     FIND_FIRST_EX_LARGE_FETCH);
+    if (search == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_PARAMETER)
+        search = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr, 0);
+    if (search == INVALID_HANDLE_VALUE) {
+        if (GetLastError() == ERROR_FILE_NOT_FOUND)
+            return files;
         throw std::runtime_error("Cannot read folder");
-    for (auto end = fs::directory_iterator(); it != end; it.increment(ec)) {
-        if (ec)
-            throw std::runtime_error("Folder enumeration failed");
-        if (!it->is_regular_file(ec))
-            continue;
-        auto p = it->path();
-        auto ext = folded(p.extension().wstring());
-        if (ext == L".png" || ext == L".jpg" || ext == L".jpeg" || ext == L".bmp" || ext == L".gif" ||
-            ext == L".tif" || ext == L".tiff")
-            files.push_back({utf8(fs::absolute(p).lexically_normal().wstring()), utf8(p.filename().wstring()),
-                             utf8(folded(p.filename().wstring()))});
     }
-    if (ec)
+    DWORD error = ERROR_NO_MORE_FILES;
+    try {
+        do {
+            if (cancelled && cancelled->load())
+                break;
+            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                continue;
+            std::wstring name = data.cFileName;
+            auto dot = name.find_last_of(L'.');
+            if (dot == std::wstring::npos)
+                continue;
+            auto ext = folded(name.substr(dot));
+            if (ext == L".png" || ext == L".jpg" || ext == L".jpeg" || ext == L".bmp" || ext == L".gif" ||
+                ext == L".tif" || ext == L".tiff") {
+                auto filename = utf8(name);
+                files.push_back({prefix + filename, filename, utf8(folded(name))});
+            }
+        } while (FindNextFileW(search, &data));
+        error = GetLastError();
+    } catch (...) {
+        FindClose(search);
+        throw;
+    }
+    FindClose(search);
+    if (!(cancelled && cancelled->load()) && error != ERROR_NO_MORE_FILES)
         throw std::runtime_error("Folder enumeration failed");
     return files;
 }

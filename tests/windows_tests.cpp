@@ -32,7 +32,7 @@ static void solid(const fs::path &p, int w, int h, Color c) {
     CHECK(b.Save(p.c_str(), &enc, nullptr) == Ok);
 }
 int wmain(int argc, wchar_t **argv) {
-    if (argc != 2)
+    if (argc != 2 && argc != 3)
         return 2;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     auto com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -118,7 +118,27 @@ int wmain(int argc, wchar_t **argv) {
                 }
         }
         std::cout << "PASS: native image export and pixel preservation" << std::endl;
-        if (argc == 2) {
+        if (argc == 3) {
+            platform::ComApartment apartment;
+            platform::PreviewDecoder decoder;
+            for (int orientation = 1; orientation <= 8; ++orientation) {
+                auto file = fs::path(argv[2]) / (L"orientation-" + std::to_wstring(orientation) + L".jpg");
+                auto original = platform::load(utf8(file.wstring()), 0);
+                auto preview = decoder.load(utf8(file.wstring()), 2048);
+                CHECK(preview->width == int(original->GetWidth()) &&
+                      preview->height == int(original->GetHeight()));
+                for (int y = 2; y < preview->height - 2; y += 7)
+                    for (int x = 2; x < preview->width - 2; x += 7) {
+                        Color c;
+                        original->GetPixel(x, y, &c);
+                        auto pixel = static_cast<BYTE *>(preview->pixels) + (y * preview->width + x) * 4;
+                        CHECK(std::abs(int(pixel[2]) - c.GetR()) <= 2 &&
+                              std::abs(int(pixel[1]) - c.GetG()) <= 2 &&
+                              std::abs(int(pixel[0]) - c.GetB()) <= 2);
+                    }
+            }
+        }
+        {
             App app;
             app.settingsPath = (root / L"settings.icmp").wstring();
             app.model.categories.push_back("复核");
@@ -142,7 +162,14 @@ int wmain(int argc, wchar_t **argv) {
             CHECK(w);
             ShowWindow(w, SW_SHOW);
             app.addFolders({(root / L"参考图").wstring(), (root / L"处理图").wstring()});
+            const auto scanDeadline = GetTickCount64() + 5000;
+            while (app.scanning && GetTickCount64() < scanDeadline)
+                pump(10);
+            CHECK(!app.scanning && app.model.folders.size() == 2);
             app.command(C_MODE);
+            while (app.scanning && GetTickCount64() < scanDeadline)
+                pump(10);
+            CHECK(!app.scanning);
             app.model.position = 1; // broken.png sorts before Chinese names; 图1 is row 1.
             app.invalidate();
             const auto loadDeadline = GetTickCount64() + 5000;
@@ -184,7 +211,10 @@ int wmain(int argc, wchar_t **argv) {
             CHECK(app.save()); // Atomic replacement of existing project.
             app.open(app.projectPath);
             CHECK(app.model.edits == ic::deserialize(platform::readProject(app.projectPath)).edits);
-            CHECK(app.model.folders[0].files.size() == 3);
+            const auto openDeadline = GetTickCount64() + 5000;
+            while (app.scanning && GetTickCount64() < openDeadline)
+                pump(10);
+            CHECK(!app.scanning && app.model.folders[0].files.size() == 3);
             app.command(C_FOCUS);
             pump(100);
             CHECK(app.panes.size() == 1);
@@ -194,6 +224,72 @@ int wmain(int argc, wchar_t **argv) {
             app.command(C_FOCUS);
             pump(100);
             CHECK(app.panes.size() == 2);
+            // Browse mode left drag pans the shared view, without adding edits or undo steps.
+            app.command(C_RECT);
+            app.command(C_FIT);
+            pump(50);
+            auto view = app.panes[0].view;
+            PointF center{view.x + view.w / 2, view.y + view.h / 2};
+            app.zoomAt(center, 4.);
+            pump(50);
+            float beforePanX = app.panes[0].image.x;
+            auto undoCount = app.model.undoStack.size();
+            auto rectCount = app.model.edit(targets[0]).rects.size();
+            SendMessageW(w, WM_LBUTTONDOWN, MK_LBUTTON, pack(center.X, center.Y));
+            CHECK(app.drag == 2);
+            SendMessageW(w, WM_MOUSEMOVE, MK_LBUTTON, pack(center.X + 40, center.Y + 30));
+            SendMessageW(w, WM_LBUTTONUP, 0, pack(center.X + 40, center.Y + 30));
+            CHECK(app.drag == 0 && app.panX > 0 && app.panY > 0);
+            CHECK(app.model.undoStack.size() == undoCount &&
+                  app.model.edit(targets[0]).rects.size() == rectCount);
+            pump(50);
+            CHECK(app.panes[0].image.x > beforePanX);
+            app.command(C_FIT);
+            pump(180);
+            CHECK(app.panX == 0 && app.panY == 0 && app.zoom == 1);
+            // Repeated zoom/pan draws reuse the back buffer and decoded images.
+            const auto idleDeadline = GetTickCount64() + 5000;
+            while (app.loader->queued() && GetTickCount64() < idleDeadline)
+                pump(10);
+            CHECK(app.loader->queued() == 0);
+            auto rendered = app.panes[0].image;
+            COLORREF outside = GetPixel(app.backDC, int((rendered.x + rendered.w * .9f) * app.scale),
+                                        int((rendered.y + rendered.h * .9f) * app.scale));
+            COLORREF inside = GetPixel(app.backDC, int((rendered.x + rendered.w * .35f) * app.scale),
+                                       int((rendered.y + rendered.h * .35f) * app.scale));
+            CHECK(outside == RGB(240, 120, 60) && inside == RGB(0, 0, 0));
+            auto allocations = app.bufferAllocations;
+            auto decoded = app.loader->decoded.load();
+            HDC dc = GetDC(w);
+            for (int i = 0; i < 10; ++i) {
+                app.zoom = 2 + i * .1;
+                app.paint(dc);
+            }
+            ReleaseDC(w, dc);
+            CHECK(app.bufferAllocations == allocations && app.loader->decoded.load() == decoded);
+            auto nextPath = app.model.rows[app.model.position + 1].paths[0];
+            CHECK(app.loader->contains(nextPath));
+            HDC nextDC = GetDC(w);
+            app.nav(1);
+            app.paint(nextDC);
+            ReleaseDC(w, nextDC);
+            CHECK(app.panes[0].path == nextPath && app.panes[0].image.w > 0);
+            app.nav(-1);
+            pump(50);
+            // Repeated add requests merge; replacing a project cancels stale scan completions.
+            fs::create_directories(root / L"third");
+            fs::create_directories(root / L"fourth");
+            app.addFolders({(root / L"third").wstring()});
+            app.addFolders({(root / L"fourth").wstring()});
+            const auto mergedDeadline = GetTickCount64() + 5000;
+            while (app.scanning && GetTickCount64() < mergedDeadline)
+                pump(10);
+            CHECK(!app.scanning && app.model.folders.size() == 4);
+            app.dirty = false;
+            app.rescan();
+            app.command(C_NEW);
+            pump(100);
+            CHECK(!app.scanning && app.model.folders.empty() && app.model.rows.empty());
             // Close the test window without prompting to save synthetic edits.
             app.dirty = false;
             DestroyWindow(w);
