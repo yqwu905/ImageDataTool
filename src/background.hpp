@@ -21,11 +21,12 @@ class Loader {
     std::mutex mu;
     std::condition_variable cv;
     bool stop = false;
-    int maxEdge = 2048;
+    int maxEdge = 2560;
     uint64_t generation = 0, tick = 0, inFlightGeneration = 0;
     std::string inFlight;
     std::deque<Job> jobs;
     std::set<std::string> pending, active;
+    std::map<std::string, size_t> priority;
     std::vector<std::string> lastWanted, lastActive;
     std::map<std::string, CacheEntry> cache;
     size_t bytes = 0;
@@ -70,9 +71,15 @@ class Loader {
                 while (bytes > 192 * 1024 * 1024 || cache.size() > 512) {
                     auto oldest = cache.end();
                     for (auto it = cache.begin(); it != cache.end(); ++it)
-                        if (!active.count(it->first) &&
-                            (oldest == cache.end() || it->second.age < oldest->second.age))
-                            oldest = it;
+                        if (active.count(it->first))
+                            continue;
+                    auto rank = [&](const std::string &path) {
+                        auto p = priority.find(path);
+                        return p == priority.end() ? size_t(-1) : p->second;
+                    };
+                    if (oldest == cache.end() || rank(it->first) > rank(oldest->first) ||
+                        (rank(it->first) == rank(oldest->first) && it->second.age < oldest->second.age))
+                        oldest = it;
                     if (oldest == cache.end())
                         break;
                     bytes -= size(oldest->second);
@@ -101,7 +108,7 @@ class Loader {
     void configure(size_t count) {
         std::lock_guard<std::mutex> lock(mu);
         maxEdge = std::min(
-            2048, std::max(256, int(std::sqrt(64. * 1024 * 1024 / (4 * std::max(size_t(1), count))))));
+            2048, std::max(256, int(std::sqrt(96. * 1024 * 1024 / (4 * std::max(size_t(1), count))))));
     }
     void clear(size_t count = 1) {
         configure(count);
@@ -112,6 +119,7 @@ class Loader {
             jobs.clear();
             pending.clear();
             active.clear();
+            priority.clear();
             lastWanted.clear();
             lastActive.clear();
             cache.swap(retired);
@@ -126,6 +134,9 @@ class Loader {
             return;
         lastWanted = wanted;
         lastActive = current;
+        priority.clear();
+        for (size_t i = 0; i < wanted.size(); ++i)
+            priority.emplace(wanted[i], i);
         active.clear();
         for (auto &path : current)
             if (!path.empty())
