@@ -93,20 +93,22 @@ class PreviewDecoder {
             source = scaler.p;
         }
         static const WICBitmapTransformOptions transforms[] = {
-            WICBitmapTransformRotate0,
-            WICBitmapTransformRotate0,
-            WICBitmapTransformFlipHorizontal,
-            WICBitmapTransformRotate180,
-            WICBitmapTransformFlipVertical,
-            WICBitmapTransformOptions(WICBitmapTransformRotate90 | WICBitmapTransformFlipHorizontal),
-            WICBitmapTransformRotate90,
-            WICBitmapTransformOptions(WICBitmapTransformRotate270 | WICBitmapTransformFlipHorizontal),
-            WICBitmapTransformRotate270};
+            WICBitmapTransformRotate0,   WICBitmapTransformRotate0,      WICBitmapTransformFlipHorizontal,
+            WICBitmapTransformRotate180, WICBitmapTransformFlipVertical, WICBitmapTransformRotate90,
+            WICBitmapTransformRotate90,  WICBitmapTransformRotate270,    WICBitmapTransformRotate270};
         Com<IWICBitmapFlipRotator> rotated;
         if (orientation >= 2 && orientation <= 8) {
             check(factory->CreateBitmapFlipRotator(rotated.put()));
             check(rotated->Initialize(source, transforms[orientation]));
             source = rotated.p;
+        }
+        // Keep rotation and the following horizontal mirror in separate stages. Combined
+        // WIC flags use a different composition order from GDI+ on native Windows.
+        Com<IWICBitmapFlipRotator> mirrored;
+        if (orientation == 5 || orientation == 7) {
+            check(factory->CreateBitmapFlipRotator(mirrored.put()));
+            check(mirrored->Initialize(source, WICBitmapTransformFlipHorizontal));
+            source = mirrored.p;
         }
         check(source->GetSize(&dw, &dh));
         Com<IWICFormatConverter> converted;

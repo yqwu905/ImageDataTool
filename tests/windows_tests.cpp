@@ -132,6 +132,12 @@ int wmain(int argc, wchar_t **argv) {
                         Color c;
                         original->GetPixel(x, y, &c);
                         auto pixel = static_cast<BYTE *>(preview->pixels) + (y * preview->width + x) * 4;
+                        if (std::abs(int(pixel[2]) - c.GetR()) > 2 ||
+                            std::abs(int(pixel[1]) - c.GetG()) > 2 || std::abs(int(pixel[0]) - c.GetB()) > 2)
+                            std::cerr << "EXIF " << orientation << " at " << x << "," << y << " original RGB "
+                                      << int(c.GetR()) << "," << int(c.GetG()) << "," << int(c.GetB())
+                                      << " preview RGB " << int(pixel[2]) << "," << int(pixel[1]) << ","
+                                      << int(pixel[0]) << std::endl;
                         CHECK(std::abs(int(pixel[2]) - c.GetR()) <= 2 &&
                               std::abs(int(pixel[1]) - c.GetG()) <= 2 &&
                               std::abs(int(pixel[0]) - c.GetB()) <= 2);
