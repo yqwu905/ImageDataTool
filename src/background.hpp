@@ -70,16 +70,17 @@ class Loader {
                 notify = active.count(job.path) != 0;
                 while (bytes > 192 * 1024 * 1024 || cache.size() > 512) {
                     auto oldest = cache.end();
-                    for (auto it = cache.begin(); it != cache.end(); ++it)
-                        if (active.count(it->first))
-                            continue;
                     auto rank = [&](const std::string &path) {
                         auto p = priority.find(path);
                         return p == priority.end() ? size_t(-1) : p->second;
                     };
-                    if (oldest == cache.end() || rank(it->first) > rank(oldest->first) ||
-                        (rank(it->first) == rank(oldest->first) && it->second.age < oldest->second.age))
-                        oldest = it;
+                    for (auto it = cache.begin(); it != cache.end(); ++it) {
+                        if (active.count(it->first))
+                            continue;
+                        if (oldest == cache.end() || rank(it->first) > rank(oldest->first) ||
+                            (rank(it->first) == rank(oldest->first) && it->second.age < oldest->second.age))
+                            oldest = it;
+                    }
                     if (oldest == cache.end())
                         break;
                     bytes -= size(oldest->second);
