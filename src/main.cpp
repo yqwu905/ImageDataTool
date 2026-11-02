@@ -327,6 +327,9 @@ class App {
     HWND hwnd = nullptr;
     ic::Model model;
     std::unique_ptr<Loader> loader;
+    // GDI+ resources must be destroyed before GdiplusShutdown, not at process static teardown.
+    std::unique_ptr<FontFamily> preferredFont;
+    bool fontInitialized = false;
     float scale = 1, width = 1280, height = 800;
     std::vector<Hit> hits;
     std::vector<Pane> panes;
@@ -948,15 +951,17 @@ class App {
     }
     void text(Graphics &g, const std::wstring &s, Box b, float size = 13, Color c = Color(255, 222, 227, 237),
               bool bold = false, StringAlignment align = StringAlignmentNear) {
-        static std::unique_ptr<FontFamily> preferred = [] {
+        if (!fontInitialized) {
+            fontInitialized = true;
             for (auto name : {L"Microsoft YaHei UI", L"Segoe UI", L"WenQuanYi Zen Hei", L"Arial"}) {
                 auto family = std::make_unique<FontFamily>(name);
-                if (family->IsAvailable())
-                    return family;
+                if (family->IsAvailable()) {
+                    preferredFont = std::move(family);
+                    break;
+                }
             }
-            return std::unique_ptr<FontFamily>{};
-        }();
-        Font font(preferred ? preferred.get() : FontFamily::GenericSansSerif(), size,
+        }
+        Font font(preferredFont ? preferredFont.get() : FontFamily::GenericSansSerif(), size,
                   bold ? FontStyleBold : FontStyleRegular, UnitPixel);
         SolidBrush brush(c);
         StringFormat f;

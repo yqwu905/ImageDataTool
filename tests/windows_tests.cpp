@@ -117,6 +117,7 @@ int wmain(int argc, wchar_t **argv) {
                     CHECK(after.GetValue() == (covered ? Color(255, 0, 0, 0).GetValue() : before.GetValue()));
                 }
         }
+        std::cout << "PASS: native image export and pixel preservation" << std::endl;
         if (argc == 2) {
             App app;
             app.settingsPath = (root / L"settings.icmp").wstring();
@@ -200,7 +201,8 @@ int wmain(int argc, wchar_t **argv) {
         }
         std::cout << "PASS: Unicode scan, bad image, opaque black pixels, proportional masks, full-size "
                      "export, alpha, real Win32 mouse events, synchronized undo/redo, tags, project "
-                     "replace/reopen, single/grid switch\n";
+                     "replace/reopen, single/grid switch"
+                  << std::endl;
     } catch (const std::exception &ex) {
         std::cerr << ex.what() << '\n';
         result = 1;
