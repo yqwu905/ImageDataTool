@@ -105,6 +105,18 @@ int wmain(int argc, wchar_t **argv) {
                     CHECK(a.GetValue() == b.GetValue());
                 }
         }
+        {
+            platform::exportPng(utf8((root / L"pattern.png").wstring()), root / L"pattern-masked.png", e);
+            Bitmap source((root / L"pattern.png").c_str()), masked((root / L"pattern-masked.png").c_str());
+            for (int y = 0; y < 13; ++y)
+                for (int x = 0; x < 17; ++x) {
+                    Color before, after;
+                    source.GetPixel(x, y, &before);
+                    masked.GetPixel(x, y, &after);
+                    const bool covered = x >= 3 && x < 9 && y >= 3 && y < 7;
+                    CHECK(after.GetValue() == (covered ? Color(255, 0, 0, 0).GetValue() : before.GetValue()));
+                }
+        }
         if (argc == 2) {
             App app;
             app.settingsPath = (root / L"settings.icmp").wstring();

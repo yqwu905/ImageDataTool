@@ -31,7 +31,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure --output-junit test-results.xml
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: test-results-linux
           path: |
@@ -54,7 +54,7 @@ jobs:
         shell: pwsh
         run: ./build-windows.ps1 -Configuration MinSizeRel -Package -Version $env:RELEASE_VERSION
       - name: Upload Windows packages
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ImageCompare-windows-x64
           path: dist/*
@@ -63,7 +63,7 @@ jobs:
           compression-level: 0
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: test-results-windows
           path: |
@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: ImageCompare-windows-x64
           path: dist

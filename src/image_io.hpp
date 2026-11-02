@@ -116,6 +116,28 @@ inline std::shared_ptr<Gdiplus::Bitmap> load(const std::string &path, int maxEdg
     auto result = std::make_shared<Bitmap>(dw, dh, PixelFormat32bppARGB);
     if (result->GetLastStatus() != Ok)
         throw std::runtime_error("Cannot allocate image");
+    if (scale == 1.) {
+        // DrawImage can round semi-transparent colors on native Windows, even at 1:1.
+        // Copy straight ARGB scanlines instead; the new bitmap also drops source metadata.
+        Gdiplus::Rect bounds(0, 0, dw, dh);
+        BitmapData source{}, target{};
+        if (original->LockBits(&bounds, ImageLockModeRead, PixelFormat32bppARGB, &source) != Ok)
+            throw std::runtime_error("Cannot read image pixels");
+        if (result->LockBits(&bounds, ImageLockModeWrite, PixelFormat32bppARGB, &target) != Ok) {
+            original->UnlockBits(&source);
+            throw std::runtime_error("Cannot allocate image pixels");
+        }
+        for (int y = 0; y < dh; ++y) {
+            auto *from = static_cast<const BYTE *>(source.Scan0) + ptrdiff_t(y) * source.Stride;
+            auto *to = static_cast<BYTE *>(target.Scan0) + ptrdiff_t(y) * target.Stride;
+            std::memcpy(to, from, size_t(dw) * 4);
+        }
+        auto readStatus = original->UnlockBits(&source);
+        auto writeStatus = result->UnlockBits(&target);
+        if (readStatus != Ok || writeStatus != Ok)
+            throw std::runtime_error("Cannot finish image pixel copy");
+        return result;
+    }
     Graphics g(result.get());
     g.Clear(Color(0, 0, 0, 0));
     g.SetCompositingMode(CompositingModeSourceCopy);
@@ -138,21 +160,28 @@ inline CLSID pngEncoder() {
 }
 inline void exportPng(const std::string &source, const fs::path &dest, const ic::Edit &edit) {
     auto image = load(source, 0);
-    {
-        Gdiplus::Graphics g(image.get());
-        g.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
-        Gdiplus::SolidBrush black(Gdiplus::Color(255, 0, 0, 0));
+    if (!edit.rects.empty()) {
+        for (auto &r : edit.rects)
+            if (!ic::valid(r))
+                throw std::runtime_error("Invalid mask rectangle");
         int width = int(image->GetWidth()), height = int(image->GetHeight());
+        Gdiplus::Rect bounds(0, 0, width, height);
+        Gdiplus::BitmapData pixels{};
+        if (image->LockBits(&bounds, Gdiplus::ImageLockModeRead | Gdiplus::ImageLockModeWrite,
+                            PixelFormat32bppARGB, &pixels) != Gdiplus::Ok)
+            throw std::runtime_error("Cannot edit image pixels");
         for (auto &r : edit.rects) {
-            int x = std::clamp(int(std::floor(r.x * width)), 0, width),
-                y = std::clamp(int(std::floor(r.y * height)), 0, height);
-            int right = std::clamp(int(std::ceil((r.x + r.w) * width)), 0, width),
-                bottom = std::clamp(int(std::ceil((r.y + r.h) * height)), 0, height);
-            if (g.FillRectangle(&black, x, y, right - x, bottom - y) != Gdiplus::Ok)
-                throw std::runtime_error("Cannot render mask");
+            int x = std::clamp(int(std::floor(r.x * width)), 0, width);
+            int y = std::clamp(int(std::floor(r.y * height)), 0, height);
+            int right = std::clamp(int(std::ceil((r.x + r.w) * width)), 0, width);
+            int bottom = std::clamp(int(std::ceil((r.y + r.h) * height)), 0, height);
+            for (int row = y; row < bottom; ++row) {
+                auto *scan = static_cast<BYTE *>(pixels.Scan0) + ptrdiff_t(row) * pixels.Stride;
+                std::fill_n(reinterpret_cast<uint32_t *>(scan) + x, right - x, uint32_t(0xff000000));
+            }
         }
-        // End the Graphics lifetime before saving the same bitmap.
-        g.Flush(Gdiplus::FlushIntentionSync);
+        if (image->UnlockBits(&pixels) != Gdiplus::Ok)
+            throw std::runtime_error("Cannot finish image pixel edit");
     }
     auto clsid = pngEncoder();
     if (image->Save(dest.c_str(), &clsid, nullptr) != Gdiplus::Ok)
