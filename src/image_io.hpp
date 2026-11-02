@@ -1,0 +1,195 @@
+#pragma once
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <gdiplus.h>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include "core.hpp"
+namespace fs = std::filesystem;
+namespace platform {
+inline std::wstring wide(const std::string &s) {
+    if (s.empty())
+        return {};
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), int(s.size()), nullptr, 0);
+    if (!n)
+        throw std::runtime_error("Invalid UTF-8");
+    std::wstring w(n, 0);
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), int(s.size()), w.data(), n);
+    return w;
+}
+inline std::string utf8(const std::wstring &w) {
+    if (w.empty())
+        return {};
+    int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, w.data(), int(w.size()), nullptr, 0, nullptr,
+                                nullptr);
+    if (!n)
+        throw std::runtime_error("Invalid Unicode");
+    std::string s(n, 0);
+    WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, w.data(), int(w.size()), s.data(), n, nullptr,
+                        nullptr);
+    return s;
+}
+inline std::wstring folded(std::wstring w) {
+    if (!w.empty())
+        LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, w.data(), int(w.size()), w.data(),
+                      int(w.size()), nullptr, nullptr, 0);
+    return w;
+}
+inline std::string pathKey(const fs::path &p) {
+    return utf8(folded(fs::absolute(p).lexically_normal().wstring()));
+}
+inline std::vector<ic::File> scan(const std::string &folder) {
+    std::vector<ic::File> files;
+    std::error_code ec;
+    fs::directory_iterator it(fs::path(wide(folder)), ec);
+    if (ec)
+        throw std::runtime_error("Cannot read folder");
+    for (auto end = fs::directory_iterator(); it != end; it.increment(ec)) {
+        if (ec)
+            throw std::runtime_error("Folder enumeration failed");
+        if (!it->is_regular_file(ec))
+            continue;
+        auto p = it->path();
+        auto ext = folded(p.extension().wstring());
+        if (ext == L".png" || ext == L".jpg" || ext == L".jpeg" || ext == L".bmp" || ext == L".gif" ||
+            ext == L".tif" || ext == L".tiff")
+            files.push_back({utf8(fs::absolute(p).lexically_normal().wstring()), utf8(p.filename().wstring()),
+                             utf8(folded(p.filename().wstring()))});
+    }
+    if (ec)
+        throw std::runtime_error("Folder enumeration failed");
+    return files;
+}
+inline void orient(Gdiplus::Image &image) {
+    const PROPID id = 0x0112;
+    UINT n = image.GetPropertyItemSize(id);
+    if (n < sizeof(Gdiplus::PropertyItem) || n > 65536)
+        return;
+    std::vector<unsigned char> bytes(n);
+    auto *prop = reinterpret_cast<Gdiplus::PropertyItem *>(bytes.data());
+    if (image.GetPropertyItem(id, n, prop) != Gdiplus::Ok || prop->length < 2 || !prop->value)
+        return;
+    auto v = *static_cast<unsigned short *>(prop->value);
+    using namespace Gdiplus;
+    switch (v) {
+    case 2:
+        image.RotateFlip(RotateNoneFlipX);
+        break;
+    case 3:
+        image.RotateFlip(Rotate180FlipNone);
+        break;
+    case 4:
+        image.RotateFlip(Rotate180FlipX);
+        break;
+    case 5:
+        image.RotateFlip(Rotate90FlipX);
+        break;
+    case 6:
+        image.RotateFlip(Rotate90FlipNone);
+        break;
+    case 7:
+        image.RotateFlip(Rotate270FlipX);
+        break;
+    case 8:
+        image.RotateFlip(Rotate270FlipNone);
+        break;
+    default:
+        break;
+    }
+}
+inline std::shared_ptr<Gdiplus::Bitmap> load(const std::string &path, int maxEdge = 2560) {
+    using namespace Gdiplus;
+    std::unique_ptr<Bitmap> original(Bitmap::FromFile(wide(path).c_str()));
+    if (!original || original->GetLastStatus() != Ok)
+        throw std::runtime_error("Cannot decode image");
+    UINT w = original->GetWidth(), h = original->GetHeight();
+    if (!w || !h || uint64_t(w) * h > 120000000)
+        throw std::runtime_error("Image exceeds 120 MP limit");
+    orient(*original);
+    w = original->GetWidth();
+    h = original->GetHeight();
+    double scale = maxEdge ? std::min(1., double(maxEdge) / std::max(w, h)) : 1.;
+    int dw = std::max(1, int(std::round(w * scale))), dh = std::max(1, int(std::round(h * scale)));
+    auto result = std::make_shared<Bitmap>(dw, dh, PixelFormat32bppARGB);
+    if (result->GetLastStatus() != Ok)
+        throw std::runtime_error("Cannot allocate image");
+    Graphics g(result.get());
+    g.Clear(Color(0, 0, 0, 0));
+    g.SetCompositingMode(CompositingModeSourceCopy);
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    if (g.DrawImage(original.get(), Gdiplus::Rect(0, 0, dw, dh), 0, 0, w, h, UnitPixel) != Ok)
+        throw std::runtime_error("Cannot render image");
+    return result;
+}
+inline CLSID pngEncoder() {
+    UINT count = 0, size = 0;
+    Gdiplus::GetImageEncodersSize(&count, &size);
+    std::vector<unsigned char> data(size);
+    auto *list = reinterpret_cast<Gdiplus::ImageCodecInfo *>(data.data());
+    if (Gdiplus::GetImageEncoders(count, size, list) != Gdiplus::Ok)
+        throw std::runtime_error("PNG encoder unavailable");
+    for (UINT i = 0; i < count; ++i)
+        if (std::wstring(list[i].MimeType) == L"image/png")
+            return list[i].Clsid;
+    throw std::runtime_error("PNG encoder unavailable");
+}
+inline void exportPng(const std::string &source, const fs::path &dest, const ic::Edit &edit) {
+    auto image = load(source, 0);
+    {
+        Gdiplus::Graphics g(image.get());
+        g.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+        Gdiplus::SolidBrush black(Gdiplus::Color(255, 0, 0, 0));
+        int width = int(image->GetWidth()), height = int(image->GetHeight());
+        for (auto &r : edit.rects) {
+            int x = std::clamp(int(std::floor(r.x * width)), 0, width),
+                y = std::clamp(int(std::floor(r.y * height)), 0, height);
+            int right = std::clamp(int(std::ceil((r.x + r.w) * width)), 0, width),
+                bottom = std::clamp(int(std::ceil((r.y + r.h) * height)), 0, height);
+            if (g.FillRectangle(&black, x, y, right - x, bottom - y) != Gdiplus::Ok)
+                throw std::runtime_error("Cannot render mask");
+        }
+        // End the Graphics lifetime before saving the same bitmap.
+        g.Flush(Gdiplus::FlushIntentionSync);
+    }
+    auto clsid = pngEncoder();
+    if (image->Save(dest.c_str(), &clsid, nullptr) != Gdiplus::Ok)
+        throw std::runtime_error("PNG export failed");
+}
+inline void atomicWrite(const fs::path &dest, const std::string &bytes) {
+    auto temp = dest;
+    temp += L".tmp-" + std::to_wstring(GetCurrentProcessId());
+    HANDLE h =
+        CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("Cannot create temporary file");
+    DWORD written = 0;
+    bool ok = WriteFile(h, bytes.data(), DWORD(bytes.size()), &written, nullptr) && written == bytes.size() &&
+              FlushFileBuffers(h);
+    CloseHandle(h);
+    if (!ok) {
+        DeleteFileW(temp.c_str());
+        throw std::runtime_error("Cannot write project");
+    }
+    if (!MoveFileExW(temp.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temp.c_str());
+        throw std::runtime_error("Cannot replace project");
+    }
+}
+inline std::string readProject(const fs::path &p) {
+    std::ifstream in(p, std::ios::binary);
+    if (!in)
+        throw std::runtime_error("Cannot open project");
+    in.seekg(0, std::ios::end);
+    auto n = in.tellg();
+    if (n < 0 || n > 64 * 1024 * 1024)
+        throw std::runtime_error("Project too large");
+    in.seekg(0);
+    std::string s(size_t(n), '\0');
+    if (!in.read(s.data(), n))
+        throw std::runtime_error("Cannot read project");
+    return s;
+}
+} // namespace platform
